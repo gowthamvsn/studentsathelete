@@ -1,0 +1,36 @@
+LookupType,LookupId,Value
+Sport,25,Soccer
+Sport,3,Football
+Sport,7,Basketball
+Sport,12,Volleyball
+Sport,5,Baseball
+Sport,9,Softball
+Sport,14,Track & Field
+Sport,18,Wrestling
+Sport,21,Cross Country
+Sport,28,Cheer
+Sport,30,Tennis
+Sport,32,Swimming
+SurfaceType,378859,Artificial Turf
+SurfaceType,378860,Natural Grass
+SurfaceType,378861,Hardwood Court
+SurfaceType,378862,Track Surface
+SurfaceType,378863,Mat
+SurfaceType,378864,Pool Deck
+InjuryOccurred,378690,Practice
+InjuryOccurred,378691,Game
+InjuryOccurred,378692,Conditioning
+InjuryOccurred,378693,Off-Season Training
+InjuryNature,378674,Acute
+InjuryNature,378675,Overuse
+InjuryNature,378676,Chronic
+TeamLevel,1,Varsity
+TeamLevel,2,Junior Varsity
+TeamLevel,3,Freshman
+TeamLevel,4,7th/8th Grade
+School,2737,North Star High School
+School,2738,Cedar Creek High School
+School,2739,Prairie View High School
+School,2740,Lakeside High School
+School,2741,Red Oak Middle School
+School,2742,Bluebonnet Middle School

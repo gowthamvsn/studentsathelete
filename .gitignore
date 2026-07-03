@@ -1,0 +1,7 @@
+.env
+*.env
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+test_aoai.py
+check_stats.py
