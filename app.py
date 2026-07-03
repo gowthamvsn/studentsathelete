@@ -83,8 +83,17 @@ def style(fig, h=340):
     return fig
 
 # ------------------------------- data ------------------------------------
+def _data_version():
+    """Cache key tied to the data files themselves - a new data push always
+    invalidates the cache (Streamlit keeps caches across git-pull reloads)."""
+    import os
+    return tuple(
+        (f, int(os.path.getmtime(os.path.join("data", f))),
+         os.path.getsize(os.path.join("data", f)))
+        for f in sorted(os.listdir("data")) if f.endswith(".csv"))
+
 @st.cache_data
-def load():
+def load(version):
     base = "data"
     athletes = pd.read_csv(f"{base}/athletes.csv")
     injuries = pd.read_csv(f"{base}/injuries.csv", parse_dates=[
@@ -102,7 +111,7 @@ def load():
         (injuries.InjuryDate.dt.year - 1).astype(str) + "-" + injuries.InjuryDate.dt.year.astype(str).str[2:])
     return athletes, injuries, treatments, notes, refs
 
-athletes, injuries, treatments, notes, refs = load()
+athletes, injuries, treatments, notes, refs = load(_data_version())
 
 st.set_page_config(page_title="Rank One Radar - POC", page_icon="R", layout="wide")
 
