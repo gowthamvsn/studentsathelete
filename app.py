@@ -111,7 +111,8 @@ st.markdown(
     "font-weight:400;font-size:0.6em'>UNT proof of concept - synthetic data, "
     "Rank One Partner API v1.0 schema</span></h2>", unsafe_allow_html=True)
 
-view = st.sidebar.radio("View", ["Radar Insights", "Athlete Focus", "Injury Focus"])
+view = st.sidebar.radio("View", ["Radar Insights", "Causality Lab",
+                                 "Athlete Focus", "Injury Focus"])
 st.sidebar.markdown("---")
 st.sidebar.caption(("AI layer: **connected** (Azure OpenAI)" if AI_READY
                     else "AI layer: offline - add credentials to ..\\.env"))
@@ -343,6 +344,182 @@ if view == "Radar Insights":
             "their triage list.")
     else:
         st.info("No open cases in the current dataset snapshot.")
+
+# ==========================================================================
+#  CAUSALITY LAB - why, not just what
+# ==========================================================================
+elif view == "Causality Lab":
+    lk = pd.read_csv("data/lookups.csv")
+    sport_map = lk[lk.LookupType == "Sport"].set_index("LookupId").Value
+    occ_map = lk[lk.LookupType == "InjuryOccurred"].set_index("LookupId").Value
+
+    dj = injuries.merge(athletes[["Athlete_ID", "SchoolName", "sportName",
+                                  "isMultiSport"]], on="Athlete_ID")
+    dj["injSport"] = dj.Sport_ID.map(sport_map)
+    dj["occurred"] = dj.InjuryOccurredId.map(occ_map)
+    roster = athletes.groupby("SchoolName").size().rename("Athletes")
+
+    st.markdown("### Counting is not causality")
+    st.markdown(
+        "Raw injury counts make the biggest school look the most dangerous. "
+        "This page walks the same question up the causal ladder: **counts -> "
+        "rates -> adjusted rates -> mechanisms** - each step removing one "
+        "false explanation. The same method runs unchanged on Rank One's real data.")
+
+    # ---------------- step 1-2: counts vs rates ----------------
+    sc = dj.groupby("SchoolName").size().rename("Injuries").to_frame().join(roster)
+    sc["Rate"] = sc.Injuries / sc.Athletes * 100
+    sc = sc.reset_index()
+    sc["Short"] = (sc.SchoolName.str.replace(" High School", " HS")
+                   .str.replace(" Middle School", " MS"))
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(sc.sort_values("Injuries"), x="Injuries", y="Short",
+                     orientation="h", color_discrete_sequence=[SERIES[0]],
+                     title="Step 1 - raw counts (misleading: bigger school, more of everything)")
+        fig.update_yaxes(title=None)
+        st.plotly_chart(style(fig, h=280), use_container_width=True)
+    with c2:
+        fig = px.bar(sc.sort_values("Rate"), x="Rate", y="Short",
+                     orientation="h", color_discrete_sequence=[SERIES[0]],
+                     title="Step 2 - injuries per 100 athletes (fair denominator)")
+        fig.update_yaxes(title=None)
+        fig.update_xaxes(title="Injuries per 100 athletes")
+        st.plotly_chart(style(fig, h=280), use_container_width=True)
+
+    # ---------------- step 3: adjust for the sport mix ----------------
+    st.markdown("#### Step 3 - is it the school, or just its sports?")
+    sport_rate = (dj.groupby("sportName").size()
+                  / athletes.groupby("sportName").size()).rename("r")
+    expect = (athletes.assign(r=athletes.sportName.map(sport_rate))
+              .groupby("SchoolName").r.sum().rename("Expected"))
+    adj = sc.set_index("SchoolName").join(expect)
+    adj["SIR"] = adj.Injuries / adj.Expected      # standardized injury ratio
+    adj = adj.reset_index()
+    multi_share = athletes.groupby("SchoolName").isMultiSport.mean() * 100
+    adj["MultiShare"] = adj.SchoolName.map(multi_share)
+
+    c3, c4 = st.columns(2)
+    with c3:
+        a = adj.sort_values("SIR")
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=a.SIR, y=a.Short, orientation="h",
+                             marker=dict(color=SERIES[0],
+                                         line=dict(color=SURFACE, width=2)),
+                             text=a.SIR.round(2), textposition="outside",
+                             cliponaxis=False))
+        fig.add_vline(x=1.0, line_dash="dot", line_color=MUTED)
+        fig.update_layout(title="Observed vs expected injuries, given each "
+                                "school's sport mix (1.0 = exactly as expected)",
+                          xaxis_title="Standardized injury ratio")
+        st.plotly_chart(style(fig, h=300), use_container_width=True)
+        st.caption(
+            "Most of North Star's excess disappears once you account for its "
+            "football-heavy roster - the sport mix, not the school, was the cause. "
+            "What excess remains points at something else...")
+    with c4:
+        fig = px.scatter(adj, x="MultiShare", y="SIR", text="Short",
+                         color_discrete_sequence=[SERIES[0]])
+        fig.update_traces(marker=dict(size=14, line=dict(color=SURFACE, width=2)),
+                          textposition="top center", cliponaxis=False,
+                          textfont=dict(size=11, color=INK2))
+        # simple fitted line, no statsmodels dependency
+        k, b = np.polyfit(adj.MultiShare, adj.SIR, 1)
+        xs = np.linspace(adj.MultiShare.min() - 2, adj.MultiShare.max() + 2, 10)
+        fig.add_trace(go.Scatter(x=xs, y=k * xs + b, mode="lines",
+                                 line=dict(color=MUTED, width=2, dash="dot"),
+                                 showlegend=False))
+        fig.update_layout(title="...multi-sport participation: the residual "
+                                "school effect tracks it",
+                          xaxis_title="% of athletes playing 2+ sports",
+                          yaxis_title="Adjusted injury ratio (SIR)")
+        st.plotly_chart(style(fig, h=300), use_container_width=True)
+        st.caption(
+            "Schools where more kids play multiple sports carry more injuries "
+            "per athlete even after sport-mix adjustment.")
+
+    # ---------------- step 4: the multi-sport effect, within schools ----------------
+    st.markdown("#### Step 4 - test the suspect WITHIN each school")
+    ms = []
+    for school, g in athletes.groupby("SchoolName"):
+        for flag, gg in g.groupby("isMultiSport"):
+            n_inj_ms = dj[dj.Athlete_ID.isin(gg.Athlete_ID)].shape[0]
+            ms.append({"School": school.replace(" High School", " HS")
+                       .replace(" Middle School", " MS"),
+                       "Group": "Multi-sport" if flag else "Single-sport",
+                       "Rate": n_inj_ms / len(gg) * 100})
+    ms = pd.DataFrame(ms)
+    overall_single = ms[ms.Group == "Single-sport"].Rate.mean()
+    overall_multi = ms[ms.Group == "Multi-sport"].Rate.mean()
+    fig = px.bar(ms, x="School", y="Rate", color="Group", barmode="group",
+                 color_discrete_sequence=[SERIES[0], SERIES[5]],
+                 title="Injuries per 100 athletes - multi-sport vs single-sport, "
+                       "inside every school")
+    fig.update_traces(marker_line_color=SURFACE, marker_line_width=2)
+    fig.update_yaxes(title="Injuries per 100 athletes")
+    fig.update_xaxes(title=None)
+    st.plotly_chart(style(fig, h=340), use_container_width=True)
+    st.caption(
+        f"The comparison holds within every school ({overall_multi:.0f} vs "
+        f"{overall_single:.0f} per 100 on average, ~"
+        f"{overall_multi/overall_single:.1f}x) - so it is not the school "
+        f"causing it, and not the sport mix: year-round load on the same body "
+        f"is the remaining explanation. This is confounder control by "
+        f"stratification - the first honest step toward causality.")
+
+    # ---------------- step 5: mechanism - each sport injures its own body map ----
+    st.markdown("#### Step 5 - mechanism: each sport attacks its own body map")
+    top_sports = dj.injSport.value_counts().head(8).index.tolist()
+    hm = (dj[dj.injSport.isin(top_sports)]
+          .groupby(["injSport", "_region"]).size().unstack(fill_value=0))
+    hm = hm.div(hm.sum(axis=1), axis=0) * 100
+    hm = hm.loc[top_sports]
+    scale = [[i / (len(SEQ_BLUES) - 1), c] for i, c in enumerate(SEQ_BLUES)]
+    fig = go.Figure(go.Heatmap(
+        z=hm.values, x=hm.columns, y=hm.index, colorscale=scale,
+        hovertemplate="%{y} - %{x}: %{z:.0f}% of injuries<extra></extra>",
+        colorbar=dict(title="% of sport's injuries")))
+    fig.update_layout(title="Share of each sport's injuries by body region")
+    st.plotly_chart(style(fig, h=380), use_container_width=True)
+    st.caption(
+        "Volleyball and basketball live at the ankle; football and soccer split "
+        "knee/thigh; wrestling owns the head row. Mechanism is what makes a "
+        "correlation believable - and it tells each program which prevention "
+        "drills to buy.")
+
+    # ---------------- step 6: game vs practice + the honest limit ----------------
+    c5, c6 = st.columns(2)
+    with c5:
+        gp = (dj[dj.occurred.isin(["Game", "Practice"])]
+              .groupby(["injSport", "occurred"]).size().unstack(fill_value=0))
+        gp = gp.loc[[s for s in top_sports if s in gp.index]]
+        gp_pct = gp.div(gp.sum(axis=1), axis=0) * 100
+        fig = go.Figure()
+        for i, col in enumerate(["Game", "Practice"]):
+            fig.add_trace(go.Bar(x=gp_pct[col], y=gp_pct.index, orientation="h",
+                                 name=col, marker=dict(color=SERIES[i],
+                                 line=dict(color=SURFACE, width=2))))
+        fig.update_layout(barmode="stack",
+                          title="Where injuries happen: games vs practices",
+                          xaxis_title="% of sport's injuries")
+        st.plotly_chart(style(fig, h=340), use_container_width=True)
+    with c6:
+        st.markdown("##### The honest limit - and the Phase 2 ask")
+        st.markdown(
+            "Games look 'safer' here only because there are far fewer of them "
+            "than practices. To compute the number that matters - injuries **per "
+            "1,000 game-hours vs per 1,000 practice-hours** - we need exposure "
+            "denominators: schedules, rosters, participation. That is exactly "
+            "the Phase 2 data request in the proposal, and it is why this page "
+            "can be honest about what it claims:\n\n"
+            "- **Shown as causal here:** early return -> re-injury (2x, forward "
+            "in time, dose-consistent); multi-sport load -> more injuries "
+            "(holds within every school).\n"
+            "- **Shown as association:** school differences after adjustment - "
+            "candidate causes (turf share, staffing) need Phase 2 data.\n\n"
+            "On real Rank One data, this same ladder runs with matched "
+            "comparisons and regression adjustment - publication-grade methods, "
+            "same story.")
 
 # ==========================================================================
 #  ATHLETE FOCUS

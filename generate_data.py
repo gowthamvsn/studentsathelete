@@ -58,6 +58,22 @@ SCHOOLS = {
     2742: "Bluebonnet Middle School",
 }
 SCHOOL_IDS = list(SCHOOLS.keys())
+
+# Each school has a CHARACTER - these are the implanted causes the app's
+# Causality Lab exists to recover:
+#   mix   - sport-emphasis multipliers (football school vs soccer school)
+#   multi - share of athletes playing 2+ sports (small schools need everyone)
+#   turf  - share of field-sport time on artificial turf
+SCHOOL_PROFILES = {
+    2737: {"mix": {3: 2.0, 18: 1.3},          "multi": 0.16, "turf": 0.85},  # North Star: football/turf school
+    2738: {"mix": {},                          "multi": 0.24, "turf": 0.50},  # Cedar Creek: balanced
+    2739: {"mix": {25: 1.9, 14: 1.5, 21: 1.4}, "multi": 0.30, "turf": 0.20},  # Prairie View: soccer/track, grass
+    2740: {"mix": {7: 1.8, 12: 1.6, 32: 1.5},  "multi": 0.12, "turf": 0.50},  # Lakeside: court sports, specialized
+    2741: {"mix": {},                          "multi": 0.45, "turf": 0.40},  # Red Oak MS: kids play everything
+    2742: {"mix": {},                          "multi": 0.45, "turf": 0.40},  # Bluebonnet MS
+}
+MULTISPORT_INJURY_MULT = 1.5   # the implanted causal effect of year-round load
+
 TEAM_LEVELS = {1: "Varsity", 2: "Junior Varsity", 3: "Freshman", 4: "7th/8th Grade"}
 SURFACES = {378859: "Artificial Turf", 378860: "Natural Grass",
             378861: "Hardwood Court", 378862: "Track Surface", 378863: "Mat",
@@ -307,14 +323,28 @@ BODY = {  # sport: (male height mu, male weight mu, female height mu, female wei
 athletes = []
 for i in range(N_ATHLETES):
     aid = 108000000 + i
-    sport_id = int(rng.choice(SPORT_IDS, p=SPORT_P))
+    school_id = int(rng.choice(SCHOOL_IDS, p=[0.24, 0.22, 0.20, 0.18, 0.08, 0.08]))
+    prof = SCHOOL_PROFILES[school_id]
+    # sport choice reflects the school's character (its "mix")
+    w = SPORT_P.copy()
+    for sid_, mult_ in prof["mix"].items():
+        w[SPORT_IDS.index(sid_)] *= mult_
+    w = w / w.sum()
+    sport_id = int(rng.choice(SPORT_IDS, p=w))
     if sport_id == 5:
         gender = "M"
     elif sport_id in (9, 28, 12):
         gender = "F" if sport_id != 12 else rng.choice(["F", "M"], p=[0.8, 0.2])
     else:
         gender = rng.choice(["M", "F"])
-    school_id = int(rng.choice(SCHOOL_IDS, p=[0.24, 0.22, 0.20, 0.18, 0.08, 0.08]))
+    # multi-sport participation: the school's culture decides how common it is
+    is_multi = rng.random() < prof["multi"]
+    second_sport = None
+    if is_multi:
+        pool = [s for s in SPORT_IDS if s != sport_id
+                and not (gender == "M" and s in (9, 28))
+                and not (gender == "F" and s == 5)]
+        second_sport = int(rng.choice(pool))
     is_ms = school_id in (2741, 2742)
     team_level = 4 if is_ms else int(rng.choice([1, 2, 3], p=[0.45, 0.35, 0.20]))
     grade = int(rng.integers(7, 9)) if is_ms else int(rng.integers(9, 13))
@@ -340,6 +370,10 @@ for i in range(N_ATHLETES):
         "YearsPlayingSport": max(1, int(rng.normal(grade - 5, 1.5))),
         "Height": max(56, min(80, height)),
         "Weight": max(85, min(295, weight)),
+        "isMultiSport": int(is_multi),
+        "secondSport_ID": second_sport,
+        "sportsPlayed": (SPORTS[sport_id][0] if not is_multi
+                         else f"{SPORTS[sport_id][0]}; {SPORTS[second_sport][0]}"),
     })
 athletes_df = pd.DataFrame(athletes)
 
@@ -375,8 +409,11 @@ SPORT_RISK = {3: 1.45, 18: 1.25, 25: 1.15, 28: 1.10, 7: 1.00, 12: 0.95,
               14: 0.90, 5: 0.85, 9: 0.85, 21: 0.80, 30: 0.60, 32: 0.55}
 
 for _, ath in athletes_df.iterrows():
-    # expected injuries over ~3 years; individual frailty multiplier adds spread
+    # expected injuries over ~3 years; individual frailty multiplier adds spread;
+    # multi-sport athletes carry year-round load - the implanted causal effect
     lam = 0.95 * SPORT_RISK.get(ath.Sport_ID, 1.0) * float(rng.gamma(2.2, 1 / 2.2))
+    if ath.isMultiSport:
+        lam *= MULTISPORT_INJURY_MULT
     n_inj = int(rng.poisson(lam))
     if n_inj == 0:
         continue                      # plenty of athletes stay healthy
@@ -394,6 +431,11 @@ for _, ath in athletes_df.iterrows():
     for k in range(n_inj):
         inj_date = inj_dates[k]
 
+        # multi-sport athletes get hurt in their second sport too
+        inj_sport = ath.Sport_ID
+        if ath.isMultiSport and ath.secondSport_ID and rng.random() < 0.35:
+            inj_sport = int(ath.secondSport_ID)
+
         # ---- re-injury is CAUSAL, not random: a premature prior return is the
         #      dominant driver, prior injury count adds to it. The model in the
         #      app exists to rediscover exactly this structure.
@@ -404,11 +446,11 @@ for _, ath in athletes_df.iterrows():
                 profile, side = last["profile"], last["side"]
                 is_reinjury = True
             else:
-                profile = pick_profile(ath.Sport_ID)
+                profile = pick_profile(inj_sport)
                 side = rng.choice(["Right", "Left"])
                 is_reinjury = False
         else:
-            profile = pick_profile(ath.Sport_ID)
+            profile = pick_profile(inj_sport)
             side = rng.choice(["Right", "Left"])
             is_reinjury = False
 
@@ -456,16 +498,18 @@ for _, ath in athletes_df.iterrows():
         surgery = complaint.endswith(("ACL Tear", "Meniscus Tear", "Wrist Fracture")) and rng.random() < 0.85
         surgery_date = inj_date + timedelta(days=int(rng.integers(4, 21))) if surgery else None
 
-        if ath.Sport_ID in (7, 12):
+        if inj_sport in (7, 12):
             surface_id = 378861
-        elif ath.Sport_ID == 18:
+        elif inj_sport == 18:
             surface_id = 378863
-        elif ath.Sport_ID == 32:
+        elif inj_sport == 32:
             surface_id = 378864
-        elif ath.Sport_ID in (14, 21):
+        elif inj_sport in (14, 21):
             surface_id = int(rng.choice([378862, 378860], p=[0.7, 0.3]))
         else:
-            surface_id = int(rng.choice([378859, 378860], p=[0.55, 0.45]))
+            # field sports play on whatever their school has
+            p_turf = SCHOOL_PROFILES[ath.SchoolId]["turf"]
+            surface_id = int(rng.choice([378859, 378860], p=[p_turf, 1 - p_turf]))
 
         occurred_id = int(rng.choice(list(OCCURRED.keys()), p=[0.52, 0.33, 0.10, 0.05]))
         nature_id = 378675 if "Tendinitis" in profile[0] or profile[0] == "Shin Splints" \
@@ -491,7 +535,7 @@ for _, ath in athletes_df.iterrows():
 
         injuries.append({
             "ID": inj_id, "User_ID": int(rng.choice(TRAINER_IDS)),
-            "Athlete_ID": ath.Athlete_ID, "Sport_ID": ath.Sport_ID,
+            "Athlete_ID": ath.Athlete_ID, "Sport_ID": inj_sport,
             "InjuryDate": inj_date,
             "InjuryDateOffset": inj_date.strftime("%Y-%m-%d %H:%M:%S -05:00"),
             "InjuryDateUnknown": int(historical and rng.random() < 0.5),
@@ -531,7 +575,7 @@ for _, ath in athletes_df.iterrows():
             "UnconsciousLength": None,
             "HeadContactItem": (random.choice(["Another Player", "Ground", "Ball", "Equipment"])
                                 if is_conc else None),
-            "WearingHelmet": (int(ath.Sport_ID == 3) if is_conc else None),
+            "WearingHelmet": (int(inj_sport == 3) if is_conc else None),
             "YearsPlayingSport": ath.YearsPlayingSport,
             "TeamLevel": ath.TeamLevel,
             "ATCEvalDate": at_eval,
@@ -580,7 +624,7 @@ for _, ath in athletes_df.iterrows():
             treatments.append({
                 "InjuryTreatmentId": trt_id, "InjuryTreatmentGUID": guid(),
                 "InjuryId": inj_id, "AthleteId": ath.Athlete_ID,
-                "SportId": ath.Sport_ID,
+                "SportId": inj_sport,
                 "TreatmentDate": t_date.strftime("%Y-%m-%d %H:%M:%S -05:00"),
                 "CurrentAssessment": assessment_text(complaint, int(round(pain)),
                                                      frac, slow_case, region),
