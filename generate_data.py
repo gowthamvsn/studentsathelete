@@ -381,11 +381,18 @@ for _, ath in athletes_df.iterrows():
     if n_inj == 0:
         continue                      # plenty of athletes stay healthy
     history = []                      # (profile, side, premature, complaint)
+    # draw all dates first and SORT, so injury k really precedes injury k+1 -
+    # the causal premature-return -> re-injury chain must run forward in time
+    inj_dates = []
     for k in range(n_inj):
         year_start = int(rng.choice([2023, 2024, 2025], p=[0.29, 0.33, 0.38]))
-        inj_date = sample_injury_date(year_start)
-        if inj_date > TODAY - timedelta(days=2):
-            inj_date = TODAY - timedelta(days=int(rng.integers(2, 320)))
+        d = sample_injury_date(year_start)
+        if d > TODAY - timedelta(days=2):
+            d = TODAY - timedelta(days=int(rng.integers(2, 320)))
+        inj_dates.append(d)
+    inj_dates.sort()
+    for k in range(n_inj):
+        inj_date = inj_dates[k]
 
         # ---- re-injury is CAUSAL, not random: a premature prior return is the
         #      dominant driver, prior injury count adds to it. The model in the
@@ -412,23 +419,33 @@ for _, ath in athletes_df.iterrows():
         # ---- recovery duration has learnable drivers:
         #      prior same-site injuries, age, body mass, overuse nature, re-injury
         n_same_site = sum(1 for h in history if h["complaint"] == complaint)
-        base = max(2, rng.normal(median_days, sd_days))
+        base = max(2, rng.normal(median_days, sd_days * 0.65))
         base *= (1 + 0.13 * n_same_site)                       # scar tissue tax
         base *= (1 + 0.025 * (ath.gradeLevel - 7))             # older heal slower
         bmi_proxy = ath.Weight / max(1, ath.Height)
         base *= (1 + max(0.0, (bmi_proxy - 2.55)) * 0.35)      # mass slows lower-body healing
         if is_reinjury:
             base *= rng.uniform(1.20, 1.65)
-        slow_case = rng.random() < 0.10
-        premature = (not slow_case) and rng.random() < 0.15     # cleared too early
+        # slow recoveries are not random either: high initial pain, prior damage
+        # to the same site, and overuse conditions all predispose to stalling
+        pain0_pre = int(np.clip(rng.normal(6 if median_days > 15 else 4.5, 1.5), 1, 10))
+        p_slow = (0.03 + 0.06 * (pain0_pre >= 7) + 0.06 * (n_same_site > 0)
+                  + 0.05 * (nature_id_pre := ("Tendinitis" in profile[0]
+                                              or profile[0] == "Shin Splints")))
+        slow_case = rng.random() < p_slow
+        premature = (not slow_case) and rng.random() < 0.12     # cleared too early
         if slow_case:
-            base *= rng.uniform(1.5, 2.6)
+            base *= rng.uniform(1.5, 2.4)
         if premature:
-            base *= rng.uniform(0.52, 0.75)                     # back before ready
+            base *= rng.uniform(0.55, 0.75)                     # back before ready
         actual_days = int(round(base))
 
         est_missing = rng.random() < 0.12          # trainer never entered an estimate
-        est_days = max(2, int(round(actual_days * rng.normal(0.82, 0.18))))
+        # The trainer estimates from protocol knowledge (textbook timeline for the
+        # diagnosis) with an optimism bias - NOT from the athlete's individual risk
+        # factors (prior same-site history, age, body mass) and NOT from the future.
+        # The ML model's edge comes from learning exactly those ignored factors.
+        est_days = max(2, int(round(median_days * rng.normal(0.88, 0.15))))
         est_return = None if est_missing else inj_date + timedelta(days=est_days)
 
         is_conc = complaint == "Concussion"
@@ -453,7 +470,7 @@ for _, ath in athletes_df.iterrows():
         occurred_id = int(rng.choice(list(OCCURRED.keys()), p=[0.52, 0.33, 0.10, 0.05]))
         nature_id = 378675 if "Tendinitis" in profile[0] or profile[0] == "Shin Splints" \
             else (378676 if rng.random() < 0.05 else 378674)
-        pain0 = int(np.clip(rng.normal(6 if median_days > 15 else 4.5, 1.5), 1, 10))
+        pain0 = pain0_pre                            # same pain that drives outcome
         pain_missing = rng.random() < 0.12          # PainScale never recorded
         mech = random.choice(MECHANISMS[region])
         historical = rng.random() < 0.04            # imported from previous system
@@ -547,8 +564,10 @@ for _, ath in athletes_df.iterrows():
             ref_id += 1
 
         # ---------------- treatments (skip most for historical imports)
+        # Real cadence: near-daily early, tapering to weekly/biweekly late in
+        # long rehabs - so long cases keep receiving care to the end.
         horizon = min(actual_days, (TODAY - inj_date).days)
-        n_trt = 1 if historical else max(1, min(28, int(horizon / rng.uniform(1.8, 4.2))))
+        n_trt = 1 if historical else max(1, min(40, int(horizon / rng.uniform(1.8, 4.2))))
         pain = float(pain0)
         t_date = inj_date + timedelta(hours=float(rng.uniform(0.5, 6)))
         for t in range(n_trt):
@@ -576,7 +595,8 @@ for _, ath in athletes_df.iterrows():
                 "_dayOfRecovery": (t_date - inj_date).days,
             })
             trt_id += 1
-            gap = rng.uniform(1.2, 4.0)
+            # spread sessions over the WHOLE recovery: daily early, sparser late
+            gap = max(1.0, (horizon / max(1, n_trt)) * rng.uniform(0.6, 1.5))
             if rng.random() < 0.10:
                 gap += rng.uniform(3, 9)            # weekend/holiday/no-show gaps
             t_date += timedelta(days=float(gap))

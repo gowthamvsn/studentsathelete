@@ -66,12 +66,16 @@ BODY_REGIONS = ["Ankle", "Knee", "Thigh", "Head", "Shoulder", "Back", "Lower Leg
 REGION_COLOR = {r: SERIES[i] for i, r in enumerate(BODY_REGIONS)}
 
 def style(fig, h=340):
+    # Title pinned to the very top, horizontal legend in its own band below it,
+    # generous top margin so the two can never collide.
     fig.update_layout(
         height=h, plot_bgcolor=SURFACE, paper_bgcolor=SURFACE,
         font=dict(family='system-ui, "Segoe UI", sans-serif', color=INK2, size=13),
-        title_font=dict(color=INK, size=15),
-        margin=dict(l=10, r=10, t=48, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+        title=dict(font=dict(color=INK, size=15), x=0.01, xanchor="left",
+                   y=0.995, yanchor="top"),
+        margin=dict(l=10, r=45, t=92, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0,
+                    title_text=None, font=dict(size=12)),
         hoverlabel=dict(bgcolor="white", font_size=13),
     )
     fig.update_xaxes(gridcolor=GRID, linecolor="#c3c2b7", tickfont=dict(color=MUTED))
@@ -153,7 +157,11 @@ if view == "Radar Insights":
         m = closed.copy()
         m["bmiProxy"] = m.Weight / m.Height.clip(lower=1)
         m["pain0"] = m.PainScale.fillna(m.PainScale.median())
-        feats_cat = pd.get_dummies(m[["_bodyRegion", "sportName"]], dtype=float)
+        # the model knows the diagnosis (as the real system would), the athlete's
+        # history and physiology - the things the flat protocol estimate ignores
+        m["_dx"] = m._complaint.str.replace(r"^(Right|Left|R|L|rt|lt)\s+", "",
+                                            regex=True).str.title()
+        feats_cat = pd.get_dummies(m[["_dx", "_bodyRegion", "sportName"]], dtype=float)
         X = pd.concat([m[["gradeLevel", "bmiProxy", "pain0", "_priorSameSite",
                           "_priorInjuries", "RequiredSurgery", "isConcussion",
                           "_isReinjury"]].astype(float), feats_cat], axis=1)
@@ -181,9 +189,11 @@ if view == "Radar Insights":
     h1, h2, h3, h4 = st.columns(4)
     h1.metric("Athlete-days lost to injury", f"{int(per_ath.sum()):,}",
               help="Sum of missed-participation windows across all records.")
+    delta_txt = (f"{improvement:.0f}% less error" if improvement > 0
+                 else f"{-improvement:.0f}% more error")
     h2.metric("Return-date error: model vs trainer",
               f"{model_mae:.1f} vs {trainer_mae:.1f} days",
-              delta=f"-{improvement:.0f}% error", delta_color="inverse",
+              delta=delta_txt, delta_color="normal" if improvement > 0 else "inverse",
               help="Mean absolute error on held-out closed cases the model never saw.")
     h3.metric("Re-injury risk after early return", f"{odds_mult:.1f}x",
               help="Re-injury rate when the athlete returned well ahead of the "
@@ -204,20 +214,23 @@ if view == "Radar Insights":
                      color="Predictor",
                      color_discrete_sequence=[SERIES[2], SERIES[0]],
                      text=comp["Error (days)"].round(1))
-        fig.update_traces(textposition="outside", marker_line_color=SURFACE,
+        fig.update_traces(textposition="outside", cliponaxis=False,
+                          marker_line_color=SURFACE,
                           marker_line_width=2, showlegend=False)
         fig.update_yaxes(title=None)
         fig.update_layout(title="Average miss on return-to-play date "
                                 "(held-out cases)")
-        st.plotly_chart(style(fig, h=240), use_container_width=True)
+        st.plotly_chart(style(fig, h=250), use_container_width=True)
         st.caption(
             f"Trained on {len(closed):,} closed cases, evaluated on a 30% holdout. "
-            f"On real Rank One data this becomes the product claim: "
-            f"*'Radar predicts return dates {improvement:.0f}% more accurately "
-            f"than current practice.'*")
+            f"The model learns what the flat protocol estimate ignores - prior "
+            f"same-site injuries, age, physiology. On real Rank One data this "
+            f"becomes the product claim: *'Radar predicts return dates "
+            f"{improvement:.0f}% more accurately than current practice.'*")
 
         st.markdown("#### What actually drives recovery time")
-        imp = importances.rename(index=lambda s: s.replace("_bodyRegion_", "Region: ")
+        imp = importances.rename(index=lambda s: s.replace("_dx_", "Diagnosis: ")
+                                 .replace("_bodyRegion_", "Region: ")
                                  .replace("sportName_", "Sport: ")
                                  .replace("_priorSameSite", "Prior same-site injuries")
                                  .replace("_priorInjuries", "Prior injuries (any)")
@@ -243,12 +256,13 @@ if view == "Radar Insights":
                      color="Return type",
                      color_discrete_sequence=[SERIES[1], STATUS["critical"]],
                      text=rr["Re-injury rate"].round(0).astype(int).astype(str) + "%")
-        fig.update_traces(textposition="outside", marker_line_color=SURFACE,
+        fig.update_traces(textposition="outside", cliponaxis=False,
+                          marker_line_color=SURFACE,
                           marker_line_width=2, showlegend=False)
         fig.update_yaxes(title=None)
         fig.update_layout(title="Same-injury recurrence by how early the athlete "
                                 "was returned")
-        st.plotly_chart(style(fig, h=240), use_container_width=True)
+        st.plotly_chart(style(fig, h=250), use_container_width=True)
         st.caption(
             f"Athletes cleared substantially ahead of the typical recovery window "
             f"re-injured the same site **{odds_mult:.1f}x more often**. This single "
