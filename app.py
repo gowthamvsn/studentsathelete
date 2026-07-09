@@ -120,8 +120,8 @@ st.markdown(
     "font-weight:400;font-size:0.6em'>UNT proof of concept - synthetic data, "
     "Rank One Partner API v1.0 schema</span></h2>", unsafe_allow_html=True)
 
-view = st.sidebar.radio("View", ["Radar Insights", "Causality Lab",
-                                 "Athlete Focus", "Injury Focus"])
+view = st.sidebar.radio("View", ["Radar Insights", "Causality Lab", "Forecasts",
+                                 "Treatment Analysis", "Athlete Focus", "Injury Focus"])
 st.sidebar.markdown("---")
 st.sidebar.caption(("AI layer: **connected** (Azure OpenAI)" if AI_READY
                     else "AI layer: offline - add credentials to ..\\.env"))
@@ -529,6 +529,425 @@ elif view == "Causality Lab":
             "On real Rank One data, this same ladder runs with matched "
             "comparisons and regression adjustment - publication-grade methods, "
             "same story.")
+
+# ==========================================================================
+#  FORECASTS - turning the causal findings into per-athlete predictions
+# ==========================================================================
+elif view == "Forecasts":
+    dd = injuries.merge(athletes[["Athlete_ID", "sportName", "SchoolName", "gradeLevel",
+                                  "isMultiSport", "Height", "Weight", "YearsPlayingSport",
+                                  "firstName", "lastName"]], on="Athlete_ID")
+    dd = dd.sort_values(["Athlete_ID", "InjuryDate"])
+    dd["_daysLost"] = np.where(
+        dd.MissDayStart.notna(),
+        np.where(dd.MissDayEnd.notna(),
+                 (dd.MissDayEnd - dd.MissDayStart).dt.days,
+                 (TODAY - dd.MissDayStart).dt.days),
+        0).clip(0)
+
+    st.markdown("### Forecasts: from what happened to what happens next")
+    st.markdown(
+        "Radar Insights and Causality Lab show what the data reveals in aggregate. "
+        "This page trains models that make individual, forward-looking predictions - "
+        "the shape a real deployed product would take. All four are trained live, "
+        "on this synthetic dataset, using the fields Rank One has already documented.")
+
+    # ---------------- A. Per-athlete re-injury risk ----------------
+    st.markdown("#### 1. Re-injury risk - which athletes are likely to re-injure next")
+    dd["_prevPremature"] = dd.groupby("Athlete_ID")._premature.shift(1).fillna(0)
+
+    @st.cache_data(show_spinner="Training re-injury risk model...")
+    def train_reinjury_model(df):
+        from sklearn.ensemble import GradientBoostingClassifier
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import roc_auc_score
+        feat_cols = ["_prevPremature", "_priorInjuries", "_priorSameSite",
+                    "gradeLevel", "isMultiSport"]
+        sport_dum = pd.get_dummies(df["sportName"], prefix="Sport", dtype=float)
+        X = pd.concat([df[feat_cols].astype(float), sport_dum], axis=1)
+        y = df["_isReinjury"].astype(int)
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=11,
+                                              stratify=y)
+        clf = GradientBoostingClassifier(random_state=11, n_estimators=200,
+                                         max_depth=3, learning_rate=0.05)
+        clf.fit(Xtr, ytr)
+        proba = clf.predict_proba(Xte)[:, 1]
+        auc = roc_auc_score(yte, proba)
+        base_rate = float(y.mean())
+        imp = (pd.Series(clf.feature_importances_, index=X.columns)
+               .sort_values(ascending=False).head(6))
+        return clf, X.columns, auc, base_rate, imp
+
+    clf, feat_columns, auc, base_rate, reinj_imp = train_reinjury_model(dd)
+
+    rc1, rc2 = st.columns([1, 1.2])
+    with rc1:
+        st.metric("Model AUC (held-out cases)", f"{auc:.2f}",
+                  help="0.5 = no better than guessing, 1.0 = perfect separation. "
+                       "Trained on prior-history features only - nothing about "
+                       "the injury itself, since that hasn't happened yet.")
+        st.metric("Baseline re-injury rate", f"{base_rate*100:.0f}%",
+                  help="Share of all injuries that were repeats of a prior site. "
+                       "The model's job is to say WHICH athletes sit above this line.")
+        imp_named = reinj_imp.rename(index=lambda s: s.replace("_prevPremature",
+            "Prior return was premature").replace("_priorInjuries", "Prior injuries (any)")
+            .replace("_priorSameSite", "Prior same-site injuries")
+            .replace("gradeLevel", "Grade / age").replace("isMultiSport", "Multi-sport")
+            .replace("Sport_", "Sport: "))
+        fig = px.bar(imp_named.iloc[::-1], orientation="h",
+                     color_discrete_sequence=[SERIES[3]])
+        fig.update_layout(title="What predicts re-injury", showlegend=False,
+                          xaxis_title="Importance", yaxis_title=None)
+        st.plotly_chart(style(fig, h=260), use_container_width=True)
+
+    with rc2:
+        # score each athlete's CURRENT state (their most recent injury on record)
+        latest = dd.sort_values("InjuryDate").groupby("Athlete_ID").tail(1).copy()
+        sport_dum_all = pd.get_dummies(latest["sportName"], prefix="Sport", dtype=float)
+        Xall = pd.concat([latest[["_prevPremature", "_priorInjuries", "_priorSameSite",
+                                  "gradeLevel", "isMultiSport"]].astype(float),
+                          sport_dum_all], axis=1).reindex(columns=feat_columns, fill_value=0.0)
+        latest["_reinjRisk"] = clf.predict_proba(Xall)[:, 1] * 100
+        top_risk = latest.sort_values("_reinjRisk", ascending=False).head(12)
+        show = top_risk[["firstName", "lastName", "SchoolName", "sportName",
+                         "_priorInjuries", "_reinjRisk"]].copy()
+        show["Athlete"] = show.firstName + " " + show.lastName
+        show["School"] = show.SchoolName.str.replace(" High School", " HS").str.replace(
+            " Middle School", " MS")
+        show = show.rename(columns={"sportName": "Sport", "_priorInjuries": "Prior injuries"})
+        show["_reinjRisk"] = show["_reinjRisk"].round(0).astype(int)
+        st.dataframe(
+            show[["Athlete", "School", "Sport", "Prior injuries", "_reinjRisk"]]
+            .rename(columns={"_reinjRisk": "Re-injury risk"}),
+            use_container_width=True, hide_index=True,
+            column_config={"Re-injury risk": st.column_config.ProgressColumn(
+                "Re-injury risk", min_value=0, max_value=100, format="%d%%")})
+        st.caption(
+            "Highest-risk athletes leaguewide, scored from injury history only "
+            "(no knowledge of a future injury). This is the same causal driver as "
+            "the Radar Insights re-injury multiplier, turned into a per-athlete score.")
+
+    st.markdown("---")
+
+    # ---------------- B. Season-long burden forecast ----------------
+    st.markdown("#### 2. Season-burden forecast - who is likely to lose the most time")
+    per_ath_hist = dd.groupby("Athlete_ID")._daysLost.sum().rename("_totalDaysLost")
+    ath_feats = athletes.set_index("Athlete_ID").join(per_ath_hist).fillna({"_totalDaysLost": 0})
+    ath_feats["_bmiProxy"] = ath_feats.Weight / ath_feats.Height.clip(lower=1)
+
+    @st.cache_data(show_spinner="Training season-burden model...")
+    def train_burden_model(df):
+        from sklearn.ensemble import GradientBoostingRegressor
+        from sklearn.model_selection import train_test_split
+        feat_cols = ["gradeLevel", "isMultiSport", "_bmiProxy", "YearsPlayingSport"]
+        sport_dum = pd.get_dummies(df["sportName"], prefix="Sport", dtype=float)
+        X = pd.concat([df[feat_cols].astype(float), sport_dum], axis=1)
+        y = df["_totalDaysLost"].astype(float)
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=5)
+        gbm = GradientBoostingRegressor(random_state=5, n_estimators=200,
+                                        max_depth=3, learning_rate=0.05)
+        gbm.fit(Xtr, ytr)
+        mae = float(np.mean(np.abs(gbm.predict(Xte) - yte)))
+        pred_all = gbm.predict(X)
+        return mae, pred_all
+
+    burden_mae, burden_pred = train_burden_model(ath_feats)
+    ath_feats["_predictedBurden"] = burden_pred.clip(min=0)
+
+    bc1, bc2 = st.columns([1, 1.3])
+    with bc1:
+        st.metric("Forecast error (MAE)", f"{burden_mae:.1f} days",
+                  help="Average miss predicting an athlete's TOTAL historical lost "
+                       "days, using only sport/grade/build/tenure - attributes known "
+                       "before any injury occurs.")
+        st.caption(
+            "Built from profile attributes only (sport, grade, body-mass proxy, "
+            "years playing) - not from past injuries themselves - so it can score "
+            "athletes with zero injury history too, for preseason planning.")
+    with bc2:
+        top_burden = ath_feats.sort_values("_predictedBurden", ascending=False).head(12).reset_index()
+        top_burden["Athlete"] = top_burden.firstName + " " + top_burden.lastName
+        top_burden["School"] = top_burden.SchoolName.str.replace(
+            " High School", " HS").str.replace(" Middle School", " MS")
+        fig = px.bar(top_burden.sort_values("_predictedBurden"),
+                     x="_predictedBurden", y="Athlete", orientation="h",
+                     color_discrete_sequence=[SERIES[4]],
+                     hover_data=["School", "sportName"])
+        fig.update_layout(title="Highest projected lost-participation days (preseason forecast)",
+                          xaxis_title="Predicted days lost", yaxis_title=None)
+        st.plotly_chart(style(fig, h=340), use_container_width=True)
+
+    st.markdown("---")
+
+    # ---------------- C. Repeat-concussion recovery risk ----------------
+    st.markdown("#### 3. Repeat-concussion recovery risk")
+    conc = dd[(dd.isConcussion == 1) & (dd._actualDays.notna())].copy()
+    if len(conc):
+        conc["ConcussionHistory"] = pd.cut(
+            conc.NumberOfConcussions, bins=[-1, 0, 1, 2, 99],
+            labels=["1st known concussion", "2nd", "3rd", "4th+"])
+        cbar = conc.groupby("ConcussionHistory", observed=True)._actualDays.median().reset_index()
+        fig = px.bar(cbar, x="ConcussionHistory", y="_actualDays",
+                     color_discrete_sequence=[SERIES[6]],
+                     text=cbar._actualDays.round(0).astype(int))
+        fig.update_traces(textposition="outside", cliponaxis=False,
+                          marker_line_color=SURFACE, marker_line_width=2)
+        fig.update_layout(title="Median recovery days by concussion history",
+                          xaxis_title=None, yaxis_title="Days to clearance",
+                          showlegend=False)
+        st.plotly_chart(style(fig, h=300), use_container_width=True)
+        st.caption(
+            "Recovery from repeat concussions takes measurably longer - the same "
+            "prior-same-site penalty implanted in the recovery model applies here "
+            "via NumberOfConcussions. On real data this becomes an automatic flag: "
+            "extend the expected recovery window for any athlete with 2+ recorded "
+            "concussions before comparing them to a fresh-injury baseline.")
+    else:
+        st.info("No closed concussion cases in this dataset.")
+
+    st.markdown("---")
+
+    # ---------------- D. Availability & performance impact ----------------
+    st.markdown("#### 4. Availability impact - lost participation, by school / sport / body part")
+    st.caption(
+        "Rank One's schema has no performance stats (points, wins, playing time) - "
+        "so \"performance impact\" here means lost availability: days an athlete "
+        "could not practice or play, computed from MissDayStart/MissDayEnd and "
+        "CanPractice. This is the honest proxy available today.")
+
+    roster = athletes.groupby("SchoolName").size().rename("Athletes")
+
+    ac1, ac2, ac3 = st.columns(3)
+    with ac1:
+        by_school = dd.groupby("SchoolName")._daysLost.sum().to_frame().join(roster)
+        by_school["PerAthlete"] = by_school._daysLost / by_school.Athletes
+        by_school = by_school.reset_index()
+        by_school["Short"] = by_school.SchoolName.str.replace(
+            " High School", " HS").str.replace(" Middle School", " MS")
+        fig = px.bar(by_school.sort_values("PerAthlete"), x="PerAthlete", y="Short",
+                     orientation="h", color_discrete_sequence=[SERIES[0]])
+        fig.update_yaxes(title=None)
+        fig.update_xaxes(title="Days lost per athlete on roster")
+        fig.update_layout(title="By school (normalized)")
+        st.plotly_chart(style(fig, h=320), use_container_width=True)
+
+    with ac2:
+        roster_sport = athletes.groupby("sportName").size().rename("Athletes")
+        by_sport = dd.groupby("sportName")._daysLost.sum().to_frame().join(roster_sport)
+        by_sport["PerAthlete"] = by_sport._daysLost / by_sport.Athletes
+        by_sport = by_sport.reset_index().sort_values("PerAthlete")
+        fig = px.bar(by_sport, x="PerAthlete", y="sportName", orientation="h",
+                     color_discrete_sequence=[SERIES[1]])
+        fig.update_yaxes(title=None)
+        fig.update_xaxes(title="Days lost per participant")
+        fig.update_layout(title="By sport (normalized)")
+        st.plotly_chart(style(fig, h=320), use_container_width=True)
+
+    with ac3:
+        by_region = dd.groupby("_region")._daysLost.agg(["sum", "mean"]).reset_index()
+        by_region = by_region.sort_values("sum")
+        fig = px.bar(by_region, x="sum", y="_region", orientation="h",
+                     color_discrete_sequence=[SERIES[2]],
+                     hover_data={"mean": ":.1f"})
+        fig.update_yaxes(title=None)
+        fig.update_xaxes(title="Total days lost (all cases)")
+        fig.update_layout(title="By body part (total volume)")
+        st.plotly_chart(style(fig, h=320), use_container_width=True)
+    st.caption(
+        "Volume (total days lost) is driven by frequency; hover the body-part "
+        "chart for the average days lost PER CASE - the severity view. A region "
+        "can rank low on volume but high on severity (e.g., concussions vs ankle "
+        "sprains), and that distinction matters for where to invest prevention.")
+
+# ==========================================================================
+#  TREATMENT ANALYSIS - the visits themselves, not just the injuries
+# ==========================================================================
+elif view == "Treatment Analysis":
+    st.markdown("### Treatment Analysis")
+    st.markdown(
+        "Every other view treats treatments as a supporting signal for injury "
+        "analysis (pain trends, care gaps). This page looks at the visits "
+        "themselves - what trainers are doing, how often, and what the free-text "
+        "record says in bulk.")
+
+    tf1, tf2, tf3 = st.columns(3)
+    sports_t = ["All sports"] + sorted(athletes.sportName.unique())
+    sp_t = tf1.selectbox("Sport", sports_t, key="trt_sport")
+    years_t = ["All years"] + sorted(injuries.SchoolYear.unique())
+    yr_t = tf2.selectbox("School year", years_t, key="trt_year")
+    regions_t = ["All regions"] + BODY_REGIONS
+    rg_t = tf3.selectbox("Body region", regions_t, key="trt_region")
+
+    dinj = injuries.merge(athletes[["Athlete_ID", "sportName", "SchoolName"]], on="Athlete_ID")
+    if sp_t != "All sports":
+        dinj = dinj[dinj.sportName == sp_t]
+    if yr_t != "All years":
+        dinj = dinj[dinj.SchoolYear == yr_t]
+    if rg_t != "All regions":
+        dinj = dinj[dinj._region == rg_t]
+
+    dtrt = treatments[treatments.InjuryId.isin(dinj.ID)].merge(
+        dinj[["ID", "_region", "_complaint", "SchoolName"]].rename(columns={"ID": "InjuryId"}),
+        on="InjuryId")
+
+    tm1, tm2, tm3, tm4 = st.columns(4)
+    tm1.metric("Treatments (this filter)", f"{len(dtrt):,}")
+    per_case = dtrt.groupby("InjuryId").size()
+    tm2.metric("Median sessions per case", f"{per_case.median():.0f}" if len(per_case) else "-")
+    standalone_n = (treatments.InjuryId == 0).sum()
+    tm3.metric("Standalone treatments (no linked injury)", f"{standalone_n:,}",
+              help="Rank One's schema allows treatments with InjuryId = 0 - general "
+                   "or wellness visits not tied to a specific injury record. Not "
+                   "filtered by sport/year/region above since they carry no injury.")
+    tm4.metric("Trainers logging care", f"{treatments.CreatedBy.nunique()}")
+
+    st.markdown("---")
+
+    # ---------------- treatment plan composition ----------------
+    st.markdown("#### What trainers are doing - treatment plan composition")
+    ref_f = refs[refs.InjuryId.isin(dinj.ID)]
+    pc1, pc2, pc3 = st.columns(3)
+    for col, header, color in [(pc1, "Modalities", SERIES[0]),
+                               (pc2, "Initial Treatment", SERIES[1]),
+                               (pc3, "Therapeutic Exercise", SERIES[2])]:
+        vals = ref_f[ref_f.headerName == header].refValue.value_counts().head(8)
+        vals = vals.sort_values()
+        fig = px.bar(x=vals.values, y=vals.index, orientation="h",
+                     color_discrete_sequence=[color])
+        fig.update_yaxes(title=None)
+        fig.update_xaxes(title="Cases")
+        fig.update_layout(title=header, showlegend=False)
+        col.plotly_chart(style(fig, h=300), use_container_width=True)
+    st.caption(
+        "One recorded value per category per case (Rank One's InjuryReferences "
+        "table) - this is the first time this field has been analyzed anywhere "
+        "in the app. On real data this is a direct read on care patterns by "
+        "injury type, without touching a single free-text note.")
+
+    st.markdown("---")
+
+    # ---------------- cadence: session count + taper ----------------
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        fig = px.histogram(per_case, nbins=20, color_discrete_sequence=[SERIES[3]])
+        fig.update_layout(title="Sessions per case - how much care an injury gets",
+                          xaxis_title="Treatment sessions", yaxis_title="Cases",
+                          showlegend=False)
+        st.plotly_chart(style(fig, h=320), use_container_width=True)
+
+    with cc2:
+        gaps = []
+        for iid, g in dtrt.groupby("InjuryId"):
+            g = g.sort_values("TreatmentDate")
+            if len(g) < 2:
+                continue
+            d_days = g.TreatmentDate.diff().dt.total_seconds().dropna() / 86400
+            half = len(d_days) // 2
+            for i, gap in enumerate(d_days):
+                gaps.append({"Phase": "Early in case" if i < max(1, half) else "Late in case",
+                            "Gap": gap})
+        if gaps:
+            gdf = pd.DataFrame(gaps)
+            med = gdf.groupby("Phase").Gap.median().reindex(["Early in case", "Late in case"])
+            fig = px.bar(med.reset_index(), x="Phase", y="Gap",
+                         color_discrete_sequence=[SERIES[4]],
+                         text=med.round(1).values)
+            fig.update_traces(textposition="outside", cliponaxis=False,
+                              marker_line_color=SURFACE, marker_line_width=2)
+            fig.update_layout(title="Median days between visits - early vs late in a case",
+                              yaxis_title="Days between visits", xaxis_title=None,
+                              showlegend=False)
+            st.plotly_chart(style(fig, h=320), use_container_width=True)
+            st.caption(
+                "Confirms the intended real-world pattern: near-daily care early, "
+                "tapering as the case progresses - not a finding to sell, a sanity "
+                "check that the synthetic care pattern looks like practice.")
+        else:
+            st.info("Not enough multi-visit cases in this filter to show cadence.")
+
+    st.markdown("---")
+
+    # ---------------- care-gap monitor (open cases only) ----------------
+    st.markdown("#### Care-gap monitor - open cases going untreated")
+    open_inj = dinj[dinj.Status == "Open"]
+    last_seen = dtrt.groupby("InjuryId").TreatmentDate.max()
+    gap_rows = []
+    for _, r in open_inj.iterrows():
+        last = last_seen.get(r.ID, r.InjuryDate)
+        gap_rows.append({"Athlete_ID": r.Athlete_ID, "InjuryId": r.ID,
+                         "Complaint": r._complaint, "School": r.SchoolName,
+                         "DaysSinceLastVisit": (TODAY - last).days})
+    if gap_rows:
+        gdf2 = pd.DataFrame(gap_rows).merge(
+            athletes[["Athlete_ID", "firstName", "lastName"]], on="Athlete_ID")
+        gdf2["Athlete"] = gdf2.firstName + " " + gdf2.lastName
+        gdf2["Short"] = gdf2.School.str.replace(" High School", " HS").str.replace(
+            " Middle School", " MS")
+        g5, g10, g14 = ((gdf2.DaysSinceLastVisit >= n).sum() for n in (5, 10, 14))
+        gm1, gm2, gm3 = st.columns(3)
+        gm1.metric("Open cases, 5+ days no visit", g5)
+        gm2.metric("10+ days", g10)
+        gm3.metric("14+ days", g14)
+        stale = gdf2.sort_values("DaysSinceLastVisit", ascending=False).head(12)
+        st.dataframe(
+            stale[["Athlete", "Short", "Complaint", "DaysSinceLastVisit"]]
+            .rename(columns={"Short": "School", "DaysSinceLastVisit": "Days since last visit"}),
+            use_container_width=True, hide_index=True)
+        st.caption(
+            "Open injuries not being actively treated are exactly the ones that "
+            "resurface as documentation gaps or liability exposure - this table "
+            "already exists as one reason string in the Radar Insights watchlist; "
+            "here it stands on its own as a monitoring tool.")
+    else:
+        st.info("No open cases in the current filter.")
+
+    st.markdown("---")
+
+    # ---------------- trainer workload ----------------
+    st.markdown("#### Trainer workload")
+    tw = treatments.CreatedBy.value_counts().sort_values().reset_index()
+    tw.columns = ["Trainer (User_ID)", "Sessions"]
+    tw["Trainer (User_ID)"] = "Trainer " + tw["Trainer (User_ID)"].astype(str)
+    fig = px.bar(tw, x="Sessions", y="Trainer (User_ID)", orientation="h",
+                 color_discrete_sequence=[SERIES[5]])
+    fig.update_yaxes(title=None)
+    fig.update_layout(title="Session volume per trainer (all cases, unfiltered)",
+                      showlegend=False)
+    st.plotly_chart(style(fig, h=260), use_container_width=True)
+    st.caption(
+        "Staffing-load signal only - in this synthetic dataset trainer assignment "
+        "is random, so differences here are not a performance signal. On real "
+        "data this is a workload-balancing view, not a trainer scorecard.")
+
+    st.markdown("---")
+
+    # ---------------- AI digest across many notes at once ----------------
+    st.markdown("#### AI treatment-notes digest")
+    st.caption(
+        "The per-athlete case files (Athlete Focus) already summarize ONE case's "
+        "notes. This does the opposite: synthesize recurring themes across MANY "
+        "treatment assessments at once, for the current filter.")
+    if AI_READY:
+        sample_n = min(25, len(dtrt))
+        if sample_n and st.button(f"Summarize {sample_n} treatment notes for this filter"):
+            sample_txt = "\n---\n".join(
+                dtrt.sample(sample_n, random_state=3).CurrentAssessment.dropna().astype(str))
+            with st.spinner("Reading treatment notes..."):
+                out = ask_ai(
+                    "You are a sports-medicine analyst reviewing a batch of athletic "
+                    "trainers' treatment assessment notes for one filtered slice of a "
+                    "district's caseload. Identify: (1) recurring clinical themes or "
+                    "phrases across notes; (2) any recurring concerns a supervising "
+                    "clinician should know about; (3) whether documentation quality "
+                    "looks consistent across notes. Be concise (bullet points). Do "
+                    "not invent facts not supported by the notes.",
+                    f"FILTER: sport={sp_t}, year={yr_t}, region={rg_t}.\n\n"
+                    f"TREATMENT ASSESSMENT NOTES:\n{sample_txt}")
+            st.markdown(out)
+        elif not sample_n:
+            st.info("No treatment notes in the current filter.")
+    else:
+        st.caption("AI layer offline - add Azure OpenAI credentials to ..\\.env to enable.")
 
 # ==========================================================================
 #  ATHLETE FOCUS
